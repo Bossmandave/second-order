@@ -1,0 +1,17 @@
+{
+  "name": "second-order",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/build.mjs && python -m http.server 8099 --bind 127.0.0.1",
+    "watch": "node scripts/build.mjs --watch",
+    "build": "node scripts/build.mjs",
+    "release": "node scripts/build.mjs --release",
+    "test": "node --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "puppeteer-core": "^25.17.0"
+  },
+  "description": "An interactive workshop where one second-order solver runs both the circuits and the machines."
+}

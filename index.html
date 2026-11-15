@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Second Order — workshop</title>
+<meta name="description" content="Overload circuits and machines until they fail. One second-order solver runs both: a mass on a spring and a series RLC obey the same equation." />
+<link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+
+<!-- Social preview. og:image must be an ABSOLUTE url for most scrapers to
+     fetch it, so set the domain here once it is settled. The room is almost
+     black, which is why this is a chosen still rather than whatever an
+     automatic screenshot would have caught. -->
+<meta property="og:type" content="website" />
+<meta property="og:title" content="Second Order" />
+<meta property="og:description" content="An interactive workshop where you overload circuits and machines until they fail. One solver runs both domains." />
+<meta property="og:image" content="/og.png" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="Second Order" />
+<meta name="twitter:description" content="Overload circuits and machines until they fail — the same equation runs both." />
+<meta name="twitter:image" content="/og.png" />
+<style>
+  :root{--amber:#e8a35c;--dim:#6d7682;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;background:#060607;overflow:hidden}
+  /* touch-action:none is what makes dragging to look work on a phone.
+     Without it the browser claims the gesture for scrolling and panning
+     before the canvas ever sees a pointermove, so looking around feels
+     sticky and half the drags do nothing. */
+  #view{display:block;width:100vw;height:100vh;touch-action:none}
+  .ui{position:fixed;font:12px/1.5 var(--mono);color:var(--dim);pointer-events:none;user-select:none}
+  /* This is the only thing telling a first-time visitor how to move, so it has
+     to be read: a dark pill for contrast, near-white text, and keycaps. At
+     opacity .5 in dim grey it was invisible against the scene. */
+  #hint{left:50%;right:auto;transform:translateX(-50%);bottom:24px;text-align:center;
+        letter-spacing:.1em;text-transform:uppercase;font-size:12.5px;color:#e6e9ee;
+        white-space:nowrap;padding:9px 16px;border-radius:999px;
+        background:rgba(14,17,21,.82);border:1px solid #2a313a;
+        backdrop-filter:blur(6px)}
+  #hint kbd{font:600 11.5px var(--mono);color:var(--amber);background:#1a1f26;
+            border:1px solid #3a424d;border-bottom-width:2px;border-radius:4px;
+            padding:1px 6px;margin:0 1px}
+  #hud{left:0;right:0;top:26px;text-align:center;letter-spacing:.16em;text-transform:uppercase;
+       font-size:11px;color:var(--amber);opacity:0;transition:opacity .5s}
+  #hud.on{opacity:1}
+  /* The live settings, as real DOM text.
+     A canvas texture on a 30 cm panel is two or three device pixels per glyph
+     once a phone has framed the whole bench; these are the same numbers at
+     device resolution, so they stay sharp at every aspect. */
+  #vals{position:fixed;left:20px;bottom:62px;display:none;gap:1px;
+        flex-direction:column;background:rgba(14,17,21,.84);border:1px solid #1f242b;
+        border-radius:4px;padding:8px 2px;backdrop-filter:blur(6px);min-width:146px}
+  #vals.on{display:flex}
+  #vals .row{display:flex;align-items:baseline;justify-content:space-between;
+             gap:12px;padding:3px 12px}
+  #vals .row.live{background:rgba(232,163,92,.09)}
+  #vals .k{font:500 10px var(--mono);letter-spacing:.13em;text-transform:uppercase;
+           color:var(--dim);white-space:nowrap}
+  #vals .v{font:600 17px var(--mono);color:#f0e2c8;font-variant-numeric:tabular-nums}
+  #vals .row.live .v{color:var(--amber)}
+  #vals .u{font:500 10px var(--mono);color:var(--dim);margin-left:3px}
+  /* On a narrow screen the title ran straight through the two buttons.
+     It drops below them instead. */
+  @media (max-width:760px){
+    #hud{top:62px;font-size:10px}
+    #bar{top:16px;left:10px;right:10px;gap:4px}
+    #back,#replace,#tools > *{font-size:9.5px;padding:6px 8px;letter-spacing:.06em;
+                              white-space:nowrap}
+    #tools{gap:4px}
+    #hint{font-size:10.5px;padding:7px 12px;max-width:calc(100vw - 20px);white-space:normal}
+  }
+  @media (max-width:760px){
+    /* On a phone the column would eat the view, so it becomes a wrapped strip
+       across the bottom, above the thumbstick. */
+    #vals{left:10px;right:10px;bottom:84px;flex-direction:row;flex-wrap:wrap;
+          min-width:0;padding:5px 2px;justify-content:center}
+    #vals .row{flex-direction:column;align-items:center;gap:0;padding:2px 9px}
+    #vals .v{font-size:16px}
+  }
+  /* Thermal view was keyboard-only (T), and on a phone there is no T key, so
+     half the piece was unreachable. It is always visible now - a labelled
+     control beats a hidden shortcut on desktop too - and the key still works. */
+  #tools{display:flex;gap:6px;margin-left:auto}
+  #tools > *{font:11px var(--mono);letter-spacing:.1em;text-transform:uppercase;
+             background:rgba(20,23,28,.8);color:var(--dim);border:1px solid #1f242b;
+             padding:7px 12px;border-radius:3px;cursor:pointer;text-decoration:none;
+             -webkit-tap-highlight-color:transparent}
+  #tools > *:hover{color:#c9ced6}
+  /* Only offered while you are walking. At a station you are not lost. */
+  #recenter{display:none}
+  body:not(.working) #recenter{display:inline-block}
+  #thermal.on{color:var(--amber);border-color:rgba(232,163,92,.45);
+              background:rgba(232,163,92,.12)}
+  /* One flex row, not three fixed positions.
+     #replace used to be pinned at left:126px, a number that assumed the width
+     of the button beside it; adding two more controls put THERMAL straight
+     through RESET THE RIG on a 390px screen. A row that lays itself out
+     cannot be broken by a longer label - and the labels do change, because
+     you fit a new card at a bench and reset the rig. */
+  #bar{position:fixed;top:20px;left:20px;right:20px;display:flex;gap:6px;
+       align-items:flex-start;z-index:11;pointer-events:none}
+  #bar > *, #bar #tools > *{pointer-events:auto}
+  /* The dial.
+     A precision hunt through a resonance two percent wide is not something
+     anyone should be doing by grabbing a ten-pixel sphere in a 3D scene on a
+     touchscreen - which is what the levers asked for, and the second time
+     that complaint has come up. This is real UI at device resolution, as
+     wide as the screen and as tall as a thumb, with the station's natural
+     frequencies marked on it so lining up with one is an aim, not a search. */
+  #dial{position:fixed;left:20px;right:20px;bottom:20px;display:none;
+        background:rgba(14,17,21,.88);border:1px solid #1f242b;border-radius:6px;
+        padding:12px 16px 16px;backdrop-filter:blur(8px);z-index:12;
+        pointer-events:auto;touch-action:none;user-select:none}
+  #dial.on{display:block}
+  #dial .head{display:flex;align-items:baseline;justify-content:space-between;gap:14px}
+  #dial .lbl{font:600 10px var(--mono);letter-spacing:.16em;text-transform:uppercase;color:var(--dim)}
+  #dial .val{font:600 26px var(--mono);color:var(--amber);font-variant-numeric:tabular-nums}
+  #dial .val span{font-size:12px;color:var(--dim);margin-left:4px}
+  #dial .resp{flex:1;height:7px;border-radius:4px;background:rgba(255,255,255,.07);
+              overflow:hidden;max-width:190px}
+  #dial .resp i{display:block;height:100%;width:0;border-radius:4px;
+                background:linear-gradient(90deg,#4a7fa8,#e8a35c);transition:width .09s linear}
+  #dial .track{position:relative;height:46px;margin-top:10px;border-radius:5px;
+               background:rgba(255,255,255,.05);cursor:ew-resize}
+  #dial .mark{position:absolute;top:4px;bottom:4px;width:2px;background:rgba(232,163,92,.45)}
+  #dial .mark b{position:absolute;top:-2px;left:50%;transform:translateX(-50%);
+                font:600 9px var(--mono);color:#8e97a1;white-space:nowrap}
+  #dial .mark.hit{background:var(--amber);box-shadow:0 0 10px rgba(232,163,92,.8)}
+  #dial .mark.hit b{color:var(--amber)}
+  #dial .thumb{position:absolute;top:0;bottom:0;width:38px;margin-left:-19px;
+               border-radius:5px;background:rgba(232,163,92,.22);
+               border:1px solid rgba(232,163,92,.75);pointer-events:none}
+  @media (max-width:760px){
+    #dial{left:10px;right:10px;bottom:14px;padding:10px 12px 14px}
+    #dial .val{font-size:22px}
+    #dial .track{height:54px}
+    #dial .thumb{width:46px;margin-left:-23px}
+  }
+  /* At a station you are not walking, so the thumbstick gets out of the way
+     and the bottom of the screen belongs to the dial. */
+  body.touch.working #stick{display:none}
+  body.working #vals{bottom:118px}
+  @media (max-width:760px){ body.touch.working #vals{bottom:132px} }
+  #back{font:11px var(--mono);letter-spacing:.1em;
+        text-transform:uppercase;background:rgba(20,23,28,.8);color:var(--dim);
+        border:1px solid #1f242b;padding:7px 12px;border-radius:3px;cursor:pointer;
+        opacity:0;pointer-events:none;transition:opacity .3s}
+  #back.on{opacity:1;pointer-events:auto}
+  #back:hover{color:#c9ced6}
+  /* Sits beside "step back" and only appears at a station, because a reset
+     with nothing focused has nothing to reset. */
+  #replace{font:11px var(--mono);letter-spacing:.1em;
+           text-transform:uppercase;background:rgba(20,23,28,.8);color:var(--dim);
+           border:1px solid #1f242b;padding:7px 12px;border-radius:3px;cursor:pointer;
+           opacity:0;pointer-events:none;transition:opacity .3s}
+  #replace.on{opacity:1;pointer-events:auto}
+  #replace:hover{color:var(--amber);border-color:#3a3024}
+  #replace.dead{color:var(--amber);border-color:#4a3a28}
+
+  #gate{position:fixed;inset:0;z-index:20;background:#060607;display:flex;
+        align-items:center;justify-content:center;transition:opacity .7s;font-family:var(--mono)}
+  #gate.gone{opacity:0;pointer-events:none}
+  .g-inner{max-width:430px;padding:0 28px;text-align:center}
+  .g-inner h1{font:400 30px var(--mono);letter-spacing:.24em;color:#e8e3da;margin-bottom:20px}
+  .g-sub{font-size:13px;color:#8d96a1;line-height:1.7;margin-bottom:12px}
+  .g-note{font-size:11.5px;color:#565e68;line-height:1.75;margin-bottom:30px}
+  #enter{font:11px var(--mono);letter-spacing:.17em;text-transform:uppercase;
+         background:transparent;color:var(--amber);border:1px solid #4a3a28;
+         padding:13px 30px;border-radius:3px;cursor:pointer;transition:.2s}
+  #enter:hover{background:rgba(232,163,92,.09);border-color:var(--amber)}
+  #weight{color:#8d96a1}
+  .g-weight{font-size:10.5px;color:#454c56;margin-top:18px;letter-spacing:.08em}
+
+  /* Touch: a real element, not an invisible hit zone. The room's walk stick
+     was once a hidden region and it sat under another control, which is the
+     sort of bug you cannot see in a screenshot. */
+  #stick{position:fixed;left:26px;bottom:26px;width:104px;height:104px;border-radius:50%;
+         border:1px solid rgba(255,255,255,.11);background:rgba(18,20,24,.45);
+         display:none;touch-action:none;z-index:10}
+  #stick i{position:absolute;left:50%;top:50%;width:40px;height:40px;margin:-20px 0 0 -20px;
+           border-radius:50%;background:rgba(232,163,92,.3);border:1px solid rgba(232,163,92,.55)}
+  body.touch #stick{display:block}
+  /* Clear of the thumbstick. The stick occupies the bottom-left 104px square
+     from 26px up, and the values strip at bottom:84px ran straight under it -
+     the first two readings were behind the knob. Lifting the strip keeps it
+     full width, which matters because it wraps to two rows at the rig. */
+  body.touch #vals{bottom:142px}
+  /* The hint used to sit at bottom:150px, straight through the values strip,
+     which wraps to two rows on a narrow screen and reaches 214px. There is no
+     stable gap to aim for at the bottom of a phone, so on touch the hint goes
+     to the top, under the station title, where nothing else lives. */
+  body.touch #hint{bottom:auto;top:84px}
+</style>
+</head>
+<body>
+  <!-- The gate. A workshop that starts in darkness needs to say so before it
+       loads, or the first thing a visitor sees is a black screen they assume
+       is broken - and they should know the download before it starts. -->
+  <div id="gate">
+    <div class="g-inner">
+      <h1>Second&nbsp;Order</h1>
+      <p class="g-sub">A dark workshop. Overload the benches until something fails.</p>
+      <p class="g-note">Electrical and mechanical, solved by one engine &mdash;
+        because below the units they are the same equation.</p>
+      <button id="enter">Enter the workshop</button>
+      <p class="g-weight"><span id="weight">~0.6 MB over the wire</span> &middot; needs WebGL</p>
+    </div>
+  </div>
+
+  <canvas id="view"></canvas>
+  <div id="stick" aria-hidden="true"><i></i></div>
+  <div class="ui" id="hud"></div>
+  <div id="vals" aria-live="off"></div>
+  <div id="bar">
+    <button id="back">&larr; step back</button>
+    <button id="replace">&#8635; fit a new card</button>
+    <div id="tools">
+      <button id="recenter" title="Back to the middle of the room">re-centre</button>
+      <button id="thermal" aria-pressed="false">thermal</button>
+    </div>
+  </div>
+  <div id="dial">
+    <div class="head">
+      <span class="lbl" id="dial-lbl">drive</span>
+      <span class="resp"><i id="dial-resp"></i></span>
+      <span class="val" id="dial-val">0<span>Hz</span></span>
+    </div>
+    <div class="track" id="dial-track"><div class="thumb" id="dial-thumb"></div></div>
+  </div>
+  <div class="ui" id="hint"></div>
+  <!-- Module load failures are otherwise silent: the page stays blank and the
+       console shows nothing useful. This turns one into a visible message. -->
+  <!-- three.js addons import a bare "three" specifier, which a browser cannot
+       resolve on its own. The map points it at the vendored build, so there is
+       still no bundler and no build step. -->
+  <script>
+    addEventListener('error', (e) => {
+      console.log('BOOT ERROR:', e.message, '@', e.filename + ':' + e.lineno);
+      const d = document.getElementById('hint');
+      if (d) { d.textContent = 'load failed: ' + e.message; d.style.opacity = 1; }
+    });
+    addEventListener('unhandledrejection', (e) =>
+      console.log('BOOT REJECT:', e.reason && (e.reason.stack || e.reason.message || e.reason)));
+  </script>
+  <!-- One bundled, tree-shaken, minified file. The sources are plain ES
+       modules and the dev server serves them directly; scripts/build.mjs
+       produces this for publishing. 2.36 MB of raw modules became 643 KB. -->
+  <script type="module" src="./dist/app.js"></script>
+</body>
+</html>
