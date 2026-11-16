@@ -354,6 +354,11 @@ function setFocus(st) {
   focused = st;
   for (const s of stations) s.wakeTarget = s === st ? 1 : 0;
   if (st) st.arm();
+  // a bench you have just walked up to has not been idle for any time at all
+  lastInput = performance.now();
+  runSince = lastInput;
+  progressSeen = 0;
+  progressAt = 0;
   const el = document.getElementById('hud');
   el.textContent = st ? st.title : '';
   el.classList.toggle('on', !!st);
@@ -405,6 +410,86 @@ function toggleThermal() {
 }
 thermalBtn.onclick = toggleThermal;
 addEventListener('keydown', (e) => { if (e.code === 'KeyT') toggleThermal(); });
+
+/* The idle stop.
+ *
+ * Runs no longer end on a clock (see the note in Station#tick), so something
+ * has to decide when an abandoned bench stops solving - otherwise a tab left
+ * open overnight keeps a phone at four thousand matrix solves a frame until
+ * its battery is flat.
+ *
+ * Input is the obvious signal, but on its own it is the wrong one. A fuse
+ * creeping toward 950 degC, or a beam accumulating fatigue at resonance, is
+ * the most interesting thing the room does and you watch it with your hands
+ * off the controls. Stopping that at thirty seconds would cut off the payoff
+ * for standing still, which is the opposite of what the piece is about.
+ *
+ * So the clock only counts while NOTHING is progressing. Station#progress is
+ * monotone, so any movement in it means some part is still heading for its
+ * limit, and the run is held open until it either breaks or settles. The hard
+ * cap is there because a slow enough cook would otherwise hold a run open
+ * indefinitely.
+ */
+const IDLE = 30;           // seconds of no input and no progress
+const HARD_CAP = 300;      // no single run outlives this, whatever happens
+let lastInput = performance.now();
+let runSince = performance.now();
+let progressAt = 0, progressSeen = 0;
+let wasArmed = false;
+
+const poke = () => { lastInput = performance.now(); };
+/* Capture phase is not optional: the thumbstick calls stopPropagation on its
+ * own pointer events (see below), so walking on a phone would otherwise look
+ * exactly like an abandoned tab. */
+for (const ev of ['pointerdown', 'pointermove', 'pointerup', 'wheel', 'keydown']) {
+  addEventListener(ev, poke, { capture: true, passive: true });
+}
+
+function idleCheck(now) {
+  /* Arming is itself an intentional act, so a run that has only just started
+   * has not been idle for any length of time - whatever the input clock says.
+   *
+   * Without this, re-arming a bench that had just idled out stopped it again
+   * on the very next frame, because lastInput was half a minute stale. In the
+   * UI the click or keypress that re-armed it happens to poke the clock first,
+   * so this only showed up when something armed a station directly - but
+   * depending on listener ordering for correctness is not worth it. The stale
+   * progress baseline matters more: a fresh run starts cold, so a leftover
+   * high-water mark would stop the cooking hold from ever engaging and a
+   * re-armed fuse would idle out mid-cook.
+   */
+  const armed = !!(focused && focused.armed);
+  if (armed && !wasArmed) {
+    lastInput = now; runSince = now; progressSeen = 0; progressAt = 0;
+  }
+  wasArmed = armed;
+
+  if (!focused || !focused.armed) { runSince = now; return; }
+  /* Held inputs fire no events - WASD and the thumbstick are polled, and a
+   * knob being dragged produces one pointerdown and then nothing until you
+   * let go - so presence has to be sampled as well as listened for. */
+  if (nav.keys.size || nav.stick || grabbed || dialing) { poke(); return; }
+
+  // sampled rather than read every frame: progress moves slowly by nature
+  if (now - progressAt > 1000) {
+    progressAt = now;
+    const p = focused.progress;
+    if (p > progressSeen + 0.05) { progressSeen = p; poke(); return; }
+    progressSeen = p;
+  }
+
+  const idle = (now - lastInput) / 1000;
+  if (idle > IDLE || (now - runSince) / 1000 > HARD_CAP) {
+    /* Keep the finished run as a ghost, exactly as ending on the clock used
+     * to. Comparing this attempt against the last one is most of what makes
+     * repeated tries worth making. */
+    focused.ghosts = focused.traces.map(
+      (t) => ({ min: t.min.slice(), max: t.max.slice(), used: t.used }));
+    focused.ghostPhase = focused.phase.pts.slice();
+    focused.spend();
+    refreshReplace();
+  }
+}
 
 /* One way out, used by the button, the Escape key and clicking into the dark,
  * so the HUD cannot be left claiming you are still at a bench you have walked
@@ -492,6 +577,7 @@ function frame(now) {
 
   nav.update(realDt);
   proximity();
+  idleCheck(now);
   for (const st of stations) st.tick(dt);
   if (focused && replaceBtn.classList.contains('dead') !== !!focused.failure) refreshReplace();
   let loudest = 0;

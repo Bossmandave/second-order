@@ -60,6 +60,71 @@ function puffTexture() {
 
 let PUFF = null;
 
+/* Phones get a smaller, thinner plume.
+ *
+ * Smoke is the most fill-rate-hungry thing in the room: big overlapping
+ * alpha-blended sprites with depth writing off, which is exactly what a
+ * tile-based mobile GPU is worst at. Size costs quadratically, count costs
+ * linearly, and opacity costs nothing - so the numbers at the call sites buy
+ * visibility with opacity first and size last, and a phone takes a further
+ * cut on the two that cost.
+ *
+ * Same test as main.js: pointer capability AND a small screen, because a
+ * touchscreen laptop has a desktop GPU behind it. Declared here rather than
+ * imported because main.js imports this file, not the other way round.
+ */
+const SMALL = (('ontouchstart' in window) || navigator.maxTouchPoints > 0)
+  && Math.min(innerWidth, innerHeight) < 900;
+const SIZE_TIER = SMALL ? 0.78 : 1;
+const COUNT_TIER = SMALL ? 0.65 : 1;
+
+/* Why a shader rather than PointsMaterial.
+ *
+ * PointsMaterial has one size and one opacity for the whole cloud, so every
+ * particle was the same size for its whole life and then vanished at full
+ * strength - it popped. At 12 mm that read as a flicker and was easy to miss;
+ * at the sizes this now uses it would read as a fault. Smoke only looks like
+ * smoke if each puff expands as it rises and thins out as it goes, and both
+ * of those are per-particle. That needs twelve lines of GLSL.
+ *
+ * The life array doubles as the attribute buffer, so there is nothing to copy
+ * each frame: step() already writes it.
+ */
+const VERT = `
+  attribute float aLife;
+  uniform float uSize;
+  uniform float uScale;
+  varying float vLife;
+  void main() {
+    vLife = aLife;
+    vec4 mv = modelViewMatrix * vec4(position, 1.0);
+    // aLife runs 1 at birth to 0 at death, so this expands over the life
+    float grow = mix(1.0, 0.45, clamp(aLife, 0.0, 1.0));
+    gl_PointSize = uSize * grow * (uScale / -mv.z);
+    gl_Position = projectionMatrix * mv;
+  }
+`;
+
+const FRAG = `
+  uniform sampler2D uMap;
+  uniform vec3 uColor;
+  uniform float uOpacity;
+  varying float vLife;
+  void main() {
+    /* Eases in over the first 5% of life and out over the last 45%. The fade
+     * in is short on purpose: a burst has to appear at the moment the part
+     * dies, not a quarter of a second later. */
+    float fade = smoothstep(1.0, 0.95, vLife) * smoothstep(0.0, 0.45, vLife);
+    float a = texture2D(uMap, gl_PointCoord).a * uOpacity * fade;
+    // nothing to see: skip the blend rather than pay for it, which is most of
+    // the saving on a tiled GPU, where blending is the expensive part
+    if (a < 0.01) discard;
+    gl_FragColor = vec4(uColor, a);
+  }
+`;
+
+const _vp = new THREE.Vector2();
+
 /* Smoke.
  *
  * One Points cloud per station, recycled from a fixed pool. Particles are
@@ -72,28 +137,53 @@ export class Smoke {
    * two metres away, and at 12 mm a particle lands on about five pixels: the
    * plume was firing correctly, thirty-one particles alive and visible, and
    * nothing whatsoever appeared on screen. Smoke has to be scaled to the
-   * machine it comes off, not to the emitter that wrote it. */
-  constructor(parent, count = 90, { size = 0.012, rise = 1, opacity = 0.4, color = 0x8d8c8a } = {}) {
+   * machine it comes off, not to the emitter that wrote it.
+   *
+   * `decay` is life in reciprocal seconds: 0.33 gives a three second puff,
+   * 0.2 a five second one. A part that has just died should trail longer than
+   * one merely running hot.
+   */
+  constructor(parent, count = 90, {
+    size = 0.012, rise = 1, opacity = 0.4, color = 0x8d8c8a, decay = 0.33,
+  } = {}) {
     PUFF = PUFF || puffTexture();
-    this.count = count;
+    this.count = Math.max(24, Math.round(count * COUNT_TIER));
+    count = this.count;
     this.pos = new Float32Array(count * 3);
     this.vel = new Float32Array(count * 3);
     this.life = new Float32Array(count);
-    this.size = new Float32Array(count);
     this.next = 0;
+    this.decay = decay;
 
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(this.pos, 3));
-    geo.setAttribute('size', new THREE.BufferAttribute(this.size, 1));
-    this.mat = new THREE.PointsMaterial({
-      map: PUFF, color, transparent: true, opacity,
-      depthWrite: false, blending: THREE.NormalBlending,
-      size, sizeAttenuation: true,
+    // the authoritative life array, used directly - no per-frame copy
+    geo.setAttribute('aLife', new THREE.BufferAttribute(this.life, 1));
+    this.mat = new THREE.ShaderMaterial({
+      vertexShader: VERT,
+      fragmentShader: FRAG,
+      uniforms: {
+        uMap: { value: PUFF },
+        uColor: { value: new THREE.Color(color) },
+        uOpacity: { value: opacity },
+        uSize: { value: size * SIZE_TIER },
+        uScale: { value: 300 },
+      },
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.NormalBlending,
     });
     this.rise = rise;
     this.points = new THREE.Points(geo, this.mat);
     this.points.frustumCulled = false;
     this.points.visible = false;
+    /* Size attenuation, the way PointsMaterial does it: half the drawing
+     * buffer height, so a particle keeps its world size as you walk toward
+     * it. Taken here rather than from a resize handler so this file needs
+     * nothing wired into it from outside. */
+    this.points.onBeforeRender = (renderer) => {
+      this.mat.uniforms.uScale.value = renderer.getDrawingBufferSize(_vp).y * 0.5;
+    };
     parent.add(this.points);
     this.geo = geo;
     for (let i = 0; i < count; i++) this.pos[i * 3 + 1] = -99;
@@ -106,6 +196,7 @@ export class Smoke {
     this._rate = 0;
     this.points.visible = false;
     this.geo.attributes.position.needsUpdate = true;
+    this.geo.attributes.aLife.needsUpdate = true;
   }
 
   emit(local, rate) {
@@ -129,16 +220,19 @@ export class Smoke {
     for (let i = 0; i < this.count; i++) {
       if (this.life[i] <= 0) continue;
       any = true;
-      this.life[i] -= dt * 0.33;
+      this.life[i] -= dt * this.decay;
       // slows as it rises and spreads, the way a thin plume actually behaves
       this.vel[i * 3 + 1] *= 1 - dt * 0.55;
       this.pos[i * 3] += this.vel[i * 3] * dt;
       this.pos[i * 3 + 1] += this.vel[i * 3 + 1] * dt;
       this.pos[i * 3 + 2] += this.vel[i * 3 + 2] * dt;
-      if (this.life[i] <= 0) this.pos[i * 3 + 1] = -99;
+      if (this.life[i] <= 0) { this.life[i] = 0; this.pos[i * 3 + 1] = -99; }
     }
     this.points.visible = any;
-    if (any) this.geo.attributes.position.needsUpdate = true;
+    if (any) {
+      this.geo.attributes.position.needsUpdate = true;
+      this.geo.attributes.aLife.needsUpdate = true;
+    }
   }
 }
 

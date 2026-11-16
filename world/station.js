@@ -276,7 +276,8 @@ export class Station {
     this.beamRig = makeBeamRig();
     g.add(this.beamRig.group);
     this.card = this.beamRig.group;
-    this.smoke = new Smoke(this.card, 90, { size: 0.09, rise: 6, opacity: 0.5 });
+    this.smoke = new Smoke(this.card, 130,
+      { size: 0.135, rise: 6.5, opacity: 0.72, decay: 0.22 });
 
     /* Per-mode amplitude envelopes, for the strobe.
      *
@@ -321,8 +322,15 @@ export class Station {
      * and 12 mm particles drew a grey thread a few pixels wide above the
      * part. A resistor cooking should be the thing you notice, not something
      * you find by looking for it. Bigger particles, more of them, rising
-     * harder - measured against the same framing the player actually gets. */
-    this.smoke = new Smoke(card, 150, { size: 0.032, rise: 2.2, opacity: 0.42 });
+     * harder - measured against the same framing the player actually gets.
+     *
+     * Opacity does most of the work, because it is the one setting that is
+     * free. Size costs fill rate quadratically and a phone pays that in frame
+     * time, so 0.42 -> 0.65 buys more visibility per millisecond than extra
+     * size would. Smoke scales itself down on a phone; see SIZE_TIER in
+     * damage.js. */
+    this.smoke = new Smoke(card, 260,
+      { size: 0.068, rise: 3.2, opacity: 0.68, decay: 0.22 });
 
     const edgeMat = new THREE.MeshStandardMaterial({ map: labelTexture(this.def.short), roughness: 0.75 });
     const plate = new THREE.Mesh(new THREE.PlaneGeometry(0.44, 0.03), edgeMat);
@@ -351,8 +359,8 @@ export class Station {
      * and the comparison is worthless - it reported the smoke as DARKENING
      * the frame, which sent me looking for a blending bug that did not
      * exist.) */
-    this.smoke = new Smoke(this.card, 220,
-      { size: 0.13, rise: 10, opacity: 0.62, color: 0xc4bfb7 });
+    this.smoke = new Smoke(this.card, 300,
+      { size: 0.195, rise: 10.5, opacity: 0.80, color: 0xc4bfb7, decay: 0.2 });
     /* Measured, not guessed: the scope's outer edge sits at -0.70 and the
      * console's at +0.65 - and both stand FORWARD of the rig's centre line,
      * so perspective magnifies them by about 12% over anything at z=0. The
@@ -461,8 +469,14 @@ export class Station {
       this.beamRig.restore();
       this.modeEnv = this.modeEnv.map(() => 0);
       this.nodeEnv = null; this.spanEnv = 0; this.relax = 1;
-      this.smoke?.reset?.();
     }
+    /* Outside the beam branch on purpose. It used to be inside it, so fitting
+     * a new card left the old plume hanging in the air above it - which is
+     * unmissable at the sizes the smoke now uses. */
+    this._plumeFor = 0;
+    this._plumeAt = null;
+    this._spent = false;
+    this.smoke?.reset?.();
     this._layoutParts();
     this._paint();
   }
@@ -652,13 +666,33 @@ export class Station {
   tick(dt) {
     if (!this.active) { this.ember(dt); this.smoke?.step(dt); return; }
     if (!this.armed) { this._updateParts(dt); return; }
-    const tEnd = this.def.pace?.tEnd ?? Infinity;
     const scale = this.def.pace?.scale ?? 1;
     const b = this.sim.bench;
-    if (!b.alive || b.t >= tEnd) { this.armed = false; return; }
+    if (!b.alive) { this.armed = false; return; }
 
-    const sim = Math.min(dt * scale, tEnd - b.t);
-    b.advance(sim, H_MAX[this.def.id] ?? 1e-4);
+    /* A run lasts as long as it is being used.
+     *
+     * It used to stop at def.pace.tEnd - 3.2 real seconds on the RC bench, 8
+     * on the rig - which was an invisible clock deciding the machine had
+     * finished while you were still working it. What ends a run now is
+     * leaving the bench (setFocus disarms it), breaking something, or thirty
+     * seconds of neither touching anything nor anything getting hotter; the
+     * idle stop lives in main.js. tEnd survives as the scope's starting time
+     * base, which is all it is used for now.
+     *
+     * N_SUB caps substeps per frame. Substeps are ceil(dt / hMax) and dt
+     * grows when frames are slow, so a struggling device asked for MORE
+     * solver work per frame than a fast one - up to 25 000 on the RLC bench -
+     * and that is a spiral it cannot climb out of once runs no longer end on
+     * their own. Bounding the sim time advanced, rather than raising h, keeps
+     * every substep the size the solver was tuned for: the clock slows a
+     * little instead of the integration going wrong, which at these speeds is
+     * invisible. At 60 fps the busiest station asks for about 4 200, so this
+     * never engages until something is already struggling.
+     */
+    const hMax = H_MAX[this.def.id] ?? 1e-4;
+    const sim = Math.min(dt * scale, N_SUB * hMax);
+    b.advance(sim, hMax);
     this.traces[0].push(b.t, this.probes[0] ? this.probes[0]() : 0);
     this.traces[1].push(b.t, this.probes[1] ? this.probes[1]() : 0);
     if (this.sim.phase) { const [x, y] = this.sim.phase(); this.phase.push(x, y); }
@@ -682,6 +716,9 @@ export class Station {
       if (this.rig) {
         if (this.failure.mode === 'set') this.rig.yield_(0.18);
         this._rigPlume();
+      } else if (!this.def.beam) {
+        // the beam has its own crack burst; every other bench gets this
+        this._failPuff(this.sim.ckt.elements.find((e) => e.failed));
       }
     }
     this._paint();
@@ -731,9 +768,20 @@ export class Station {
            * the thing you are meant to notice. So the COLOUR stays physical
            * and the INTENSITY is pushed, which keeps the progression from red
            * through orange to yellow honest while making it readable. */
-          incandescence(T, body.material.emissive);
-          const over = Math.max(0, (T - 470) / 480);
-          body.material.emissiveIntensity = Math.min(4.2, over * 4.2);
+          /* Only take the material over once the part is genuinely hot.
+           *
+           * An LED's dome, body and flange share one material, and the
+           * forward-current glow a few lines up writes to that same material.
+           * Below 470 degC "over" is zero, so this used to write intensity 0
+           * over that glow every single frame and an LED never visibly lit
+           * while running. Parts that do not share a lit material are
+           * unaffected, so a resistor still cools back down through the
+           * blackbody ramp as before. */
+          if (lit !== body.material || T > 470) {
+            incandescence(T, body.material.emissive);
+            const over = Math.max(0, (T - 470) / 480);
+            body.material.emissiveIntensity = Math.min(4.2, over * 4.2);
+          }
         }
         if (T > spec.tMax * 0.78 || (el.failed && peak > spec.tMax * 0.6)) smoking += 1;
       }
@@ -760,12 +808,14 @@ export class Station {
         if (peak < spec.tMax * 0.78) continue;
         b.mesh.getWorldPosition(p);
         this.card.worldToLocal(p);
-        this.smoke.emit(p, 26 * dt);
+        this.smoke.emit(p, 48 * dt);
       }
     }
     if (this._plumeFor > 0) {
       this._plumeFor -= dt;
-      this.smoke?.emit(new THREE.Vector3(-0.235, 0.62, 0), 55 * dt);
+      // _plumeAt is set by whoever started the plume: the damper head for the
+      // rig, the dead part itself for a bench card
+      if (this._plumeAt) this.smoke?.emit(this._plumeAt, 55 * dt);
     }
     if (this.smoke) this.smoke.step(dt);
   }
@@ -780,7 +830,39 @@ export class Station {
     if (!this.smoke) return;
     const at = new THREE.Vector3(-0.235, 0.62, 0);    // damper head, clear of the plinth
     for (let i = 0; i < 90; i++) this.smoke.emit(at, 1);
+    this._plumeAt = at;
     this._plumeFor = 3.0;
+  }
+
+  /* A part that dies cold still has to look like it died.
+   *
+   * Bench smoke is gated on temperature, which is right for anything that
+   * cooks - a resistor, a fuse element - and wrong for anything that does
+   * not. An LED dies by current: the junction is microscopic and its time
+   * constant is in milliseconds, so it is dead at about room temperature and
+   * neither thermal gate ever opens. Measured at the moment of death: 25
+   * degC against a 125 degC rating, where the gate wants 97.5. So the part
+   * most people break first was the one that broke invisibly - a slightly
+   * darker dome, and nothing else whatsoever.
+   *
+   * The fix is not to lower the gate, which would make warm parts smoke when
+   * they should not. It is to let failure itself emit, keyed off el.failed
+   * the way the cap vent and the rig plume already are.
+   */
+  _failPuff(el) {
+    if (!this.smoke || !el) return;
+    const b = this.bodies.find((x) => x.el === el);
+    if (!b?.mesh || b.vented) return;   // the cap has its own, better-aimed burst
+    // anything that cooked is already smoking from the thermal path, and a
+    // second burst on top of it just looks like a glitch
+    const spec = el.spec;
+    if (spec?.tMax && this.sim.bench.thermal.of(el).peakT > spec.tMax * 0.6) return;
+    const p = new THREE.Vector3();
+    b.mesh.getWorldPosition(p);
+    this.card.worldToLocal(p);
+    for (let i = 0; i < 85; i++) this.smoke.emit(p, 1);
+    this._plumeAt = p.clone();
+    this._plumeFor = 2.8;
   }
 
   /** The can splits at its score mark and the top lifts. */
@@ -882,8 +964,44 @@ export class Station {
     this._paint();
   }
 
+  /* How far this run has got toward breaking something.
+   *
+   * Used by the idle stop to tell a bench that is still cooking from one that
+   * has settled. Both terms only ever increase - peakT is a running max, and
+   * fatigue damage only accrues above the endurance limit - so the idle clock
+   * can simply watch this number for movement and does not have to understand
+   * anything about what the station is doing.
+   */
+  get progress() {
+    const therm = this.sim.bench.thermal;
+    let s = 0;
+    for (const el of this.sim.bench.ckt.elements) {
+      const t = therm.of(el);
+      /* Temperature is the obvious term and not the only one. A fuse a little
+       * over its rating settles at a steady temperature well under its limit
+       * and dies anyway, because what kills it is accumulated I2t - so a
+       * progress signal watching only peakT would call that bench settled and
+       * stop it a couple of minutes before the thing you were waiting for.
+       * Scaled up because the limit is 4 A2s against temperatures in the
+       * hundreds, and this sum is only ever compared against itself. */
+      s += t.peakT + t.i2t * 1e3;
+    }
+    return s + (this.sim.fatigue?.damage ?? 0) * 1e4;
+  }
+
+  /* The run is over, but the bench keeps standing as you left it.
+   *
+   * Marking it spent rather than just disarming is what makes the next arm()
+   * start a fresh trace over a ghost of this one, which is how it behaved
+   * when runs ended on the clock. */
+  spend() {
+    if (!this.armed) return;
+    this.armed = false;
+    this._spent = true;
+  }
+
   arm() {
-    if (!this.sim.bench.alive || this.sim.bench.t >= (this.def.pace?.tEnd ?? Infinity)) {
+    if (!this.sim.bench.alive || this._spent) {
       /* Keep the finished run as a ghost before clearing it. Comparing this
        * attempt against the last one is most of what makes repeated tries
        * worth making. */
@@ -950,7 +1068,9 @@ export class Station {
         this.smoke.emit(p, 7 * dt);
       }
     }
-    this.smoke.step(dt);
+    // the step belongs to tick(), which calls it for every dormant station
+    // whether or not it has a scar. Doing it here as well aged every particle
+    // at double rate, so a fresh scar's embers died twice as fast as they should.
   }
 
   // -------------------------------------------------------------- lighting
@@ -993,5 +1113,10 @@ export class Station {
 }
 
 Station.thermalView = false;
+
+/* See the note in tick(). One number for every device, deliberately: this is
+ * a safety valve against slow frames, not a quality tier, so it must not
+ * change how the room behaves until something is already going wrong. */
+const N_SUB = 5000;
 
 const H_MAX = { rlc: 2e-6, rect: 4e-6, led: 5e-5, rc: 2e-4, msd: 5e-4 };
